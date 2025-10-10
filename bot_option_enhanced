@@ -1,95 +1,543 @@
-# --- إضافات: اختصارات الأوامر وScheduler للتحديث كل 10 دقائق أثناء جلسة السوق الأمريكي ---
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from zoneinfo import ZoneInfo
-from datetime import time as dtime, datetime, timedelta
+#!/usr/bin/env python3
+# bot_option_enhanced.py
+"""
+بوت تيليجرام متكامل:
+- استعلام أسعار وسلاسل خيارات (yfinance)
+- رسائل عربية (Markdown + أزرار)
+- rate limiting + cache باستخدام Redis (إن وُجد) أو بديل ملف JSON
+- اشتراكات /subscribe و /unsubscribe
+- Scheduler يرسل تحديث كل 10 دقائق خلال جلسة السوق الأمريكي
+- يدعم broadcast إما لقناة (BROADCAST_CHAT_ID) أو لكل المشتركين
+"""
 
-# قائمة الشركات الكبرى (اختصارات / أوامر سريعة)
+import os
+import json
+import logging
+import asyncio
+from datetime import datetime, timedelta, time as dtime
+from zoneinfo import ZoneInfo
+
+import yfinance as yf
+import pandas as pd
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ParseMode,
+)
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+# Optional Redis (async)
+try:
+    import redis.asyncio as redis_async
+    REDIS_AVAILABLE = True
+except Exception:
+    REDIS_AVAILABLE = False
+
+# mibian for Greeks (optional)
+try:
+    import mibian
+    MIBIAN_AVAILABLE = True
+except Exception:
+    MIBIAN_AVAILABLE = False
+
+# --- Config ---
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+REDIS_URL = os.getenv("REDIS_URL")  # optional. If not provided we'll use file-based storage
+BROADCAST_CHAT_ID = os.getenv("BROADCAST_CHAT_ID")  # optional
+OWNER_ID = os.getenv("OWNER_ID")  # optional (for admin commands)
+CACHE_TTL = int(os.getenv("CACHE_TTL", "60"))
+OPTIONS_TTL = int(os.getenv("OPTIONS_TTL", "300"))
+RATE_LIMIT = int(os.getenv("RATE_LIMIT", "30"))
+RATE_WINDOW = int(os.getenv("RATE_WINDOW", "60"))
+
+if not TELEGRAM_TOKEN:
+    raise SystemExit("Please set TELEGRAM_TOKEN environment variable.")
+
+# Logging
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# --- Storage / Redis or File fallback ---
+USE_REDIS = False
+redis_client = None
+if REDIS_URL and REDIS_AVAILABLE:
+    try:
+        redis_client = redis_async.from_url(REDIS_URL, decode_responses=True)
+        USE_REDIS = True
+        logger.info("Using Redis at %s", REDIS_URL)
+    except Exception as e:
+        logger.exception("Failed to connect to Redis: %s. Falling back to file storage.", e)
+        USE_REDIS = False
+else:
+    if REDIS_URL and not REDIS_AVAILABLE:
+        logger.warning("redis.asyncio not installed; REDIS_URL ignored. Using file fallback.")
+    USE_REDIS = False
+
+# File-based fallback paths
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+SUBSCRIBERS_FILE = os.path.join(DATA_DIR, "subscribers.json")
+RATE_FILE = os.path.join(DATA_DIR, "rate.json")
+CACHE_FILE = os.path.join(DATA_DIR, "cache.json")
+
+# ensure files exist
+for f, default in [(SUBSCRIBERS_FILE, []), (RATE_FILE, {}), (CACHE_FILE, {})]:
+    if not os.path.exists(f):
+        with open(f, "w", encoding="utf-8") as fh:
+            json.dump(default, fh)
+
+# --- Major stocks list ---
 MAJOR_STOCKS = ["AAPL","MSFT","AMZN","GOOG","NVDA","TSLA","META","BRK-B","JPM","V"]
 
-# تعريف أوامر الاختصارات للـ BotFather / واجهة البرمجة
-DEFAULT_COMMANDS = [
-    ("start", "بدء البوت / ترحيب"),
-    ("help", "قائمة الأوامر"),
-    ("price", "سعر السهم الحالي: /price SYMBOL"),
-    ("expiries", "تواريخ انتهاء الأوبشن: /expiries SYMBOL"),
-    ("chain", "سلسلة الأوبشن: /chain SYMBOL YYYY-MM-DD"),
-    ("option", "استعلام خيار: /option SYMBOL YYYY-MM-DD TYPE STRIKE"),
-]
-# أضف اختصارات الأسهم كأوامر قصيرة
-for s in MAJOR_STOCKS:
-    DEFAULT_COMMANDS.append((s.lower(), f"سعر سريع لـ {s}"))
-
-# وظيفة مساعدة لتعيين أوامر البوت عند الإقلاع
-async def set_bot_commands(app):
-    """
-    يسجل أوامر البوت ( تظهر كـ shortcuts في واجهة المستخدم ).
-    app: ApplicationBuilder().token(...).build()
-    """
-    commands = [{"command": cmd, "description": desc} for cmd, desc in DEFAULT_COMMANDS]
+# --- Helpers: File fallback operations ---
+def file_load(path):
     try:
-        await app.bot.set_my_commands(commands)
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+def file_save(path, data):
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
     except Exception as e:
-        logger.exception("Failed to set bot commands: %s", e)
+        logger.exception("file_save error: %s", e)
 
-# Handler لطلبات الاختصارات السريعة (مثلاً /aapl)
-from telegram.ext import CommandHandler
+# --- Cache helpers (Redis preferred) ---
+async def cache_get(key):
+    if USE_REDIS:
+        v = await redis_client.get(key)
+        if v is None:
+            return None
+        try:
+            return json.loads(v)
+        except Exception:
+            return v
+    else:
+        cache = file_load(CACHE_FILE) or {}
+        return cache.get(key)
 
-async def quick_stock_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    يتلقى الأمر مثل /aapl ويعيد سعر السهم المختصر.
-    اسم الدالة موجه لأننا سنربط كل اختصار ديناميكياً.
-    """
-    # أمر المستخدم مثل "/aapl" -> نأخذ اسم الأمر من update.message.text أو update.message.entities
-    cmd = update.message.text.strip().lstrip("/").split()[0].upper()
-    # بعض أوامر مثل brk-b قد تأتي على شكل brk_b في قائمة الأوامر؛ حاول تعويض
-    symbol = cmd.replace("_","-")
-    # استخدم fetch_ticker_info الموجود في سكربتك
+async def cache_set(key, value, ttl=CACHE_TTL):
+    if USE_REDIS:
+        v = json.dumps(value, default=str)
+        await redis_client.set(key, v, ex=ttl)
+    else:
+        cache = file_load(CACHE_FILE) or {}
+        cache[key] = value
+        file_save(CACHE_FILE, cache)
+
+# --- Subscribers helpers ---
+async def add_subscriber(chat_id):
+    if USE_REDIS:
+        await redis_client.sadd("subscribers:set", str(chat_id))
+    else:
+        subs = set(file_load(SUBSCRIBERS_FILE) or [])
+        subs.add(str(chat_id))
+        file_save(SUBSCRIBERS_FILE, list(subs))
+
+async def remove_subscriber(chat_id):
+    if USE_REDIS:
+        await redis_client.srem("subscribers:set", str(chat_id))
+    else:
+        subs = set(file_load(SUBSCRIBERS_FILE) or [])
+        subs.discard(str(chat_id))
+        file_save(SUBSCRIBERS_FILE, list(subs))
+
+async def list_subscribers():
+    if USE_REDIS:
+        return await redis_client.smembers("subscribers:set")
+    else:
+        return set(file_load(SUBSCRIBERS_FILE) or [])
+
+# --- Rate limiting (simple) ---
+async def rate_limit_check(user_id):
+    key = f"rl:{user_id}"
+    if USE_REDIS:
+        cur = await redis_client.incr(key)
+        if cur == 1:
+            await redis_client.expire(key, RATE_WINDOW)
+        return cur <= RATE_LIMIT
+    else:
+        rates = file_load(RATE_FILE) or {}
+        now_ts = int(datetime.utcnow().timestamp())
+        entry = rates.get(str(user_id), {"count": 0, "start": now_ts})
+        # reset if window expired
+        if now_ts - entry["start"] > RATE_WINDOW:
+            entry = {"count": 1, "start": now_ts}
+        else:
+            entry["count"] += 1
+        rates[str(user_id)] = entry
+        file_save(RATE_FILE, rates)
+        return entry["count"] <= RATE_LIMIT
+
+# --- yfinance helpers ---
+async def fetch_ticker_info(symbol: str):
+    key = f"ticker:info:{symbol}"
+    cached = await cache_get(key)
+    if cached:
+        return cached
+    tk = yf.Ticker(symbol)
+    info = tk.info or {}
+    essential = {
+        "symbol": info.get("symbol"),
+        "shortName": info.get("shortName"),
+        "regularMarketPrice": info.get("regularMarketPrice"),
+        "previousClose": info.get("previousClose"),
+        "dayHigh": info.get("dayHigh"),
+        "dayLow": info.get("dayLow"),
+        "volume": info.get("volume"),
+    }
+    await cache_set(key, essential, ttl=CACHE_TTL)
+    return essential
+
+async def fetch_expiries(symbol: str):
+    key = f"ticker:expiries:{symbol}"
+    cached = await cache_get(key)
+    if cached:
+        return cached
+    tk = yf.Ticker(symbol)
+    exps = tk.options
+    await cache_set(key, exps, ttl=OPTIONS_TTL)
+    return exps
+
+async def fetch_option_chain(symbol: str, expiry: str):
+    key = f"ticker:chain:{symbol}:{expiry}"
+    cached = await cache_get(key)
+    if cached:
+        return cached
+    tk = yf.Ticker(symbol)
+    try:
+        chain = tk.option_chain(expiry)
+        calls = chain.calls.to_dict(orient="records")
+        puts = chain.puts.to_dict(orient="records")
+        payload = {"calls": calls, "puts": puts}
+        await cache_set(key, payload, ttl=OPTIONS_TTL)
+        return payload
+    except Exception as e:
+        logger.exception("Error fetching option chain %s %s: %s", symbol, expiry, e)
+        return None
+
+# --- Greeks calculation (optional) ---
+def compute_greeks_bs(underlying_price: float, strike: float, days_to_expiry: int, volatility_pct: float, rate_pct: float = 0.0):
+    if not MIBIAN_AVAILABLE:
+        return None
+    try:
+        bs = mibian.BS([underlying_price, strike, rate_pct, days_to_expiry], volatility_pct)
+        return {
+            "delta": getattr(bs, "delta", None),
+            "gamma": getattr(bs, "gamma", None),
+            "vega": getattr(bs, "vega", None),
+            "theta": getattr(bs, "theta", None),
+            "rho": getattr(bs, "rho", None),
+        }
+    except Exception:
+        return None
+
+# --- Message formatting ---
+def esc(text: str) -> str:
+    if text is None:
+        return "-"
+    return str(text).replace("_", "\\_").replace("-", "\\-").replace(".", "\\.")
+
+def format_price_message(info: dict) -> str:
+    symbol = esc(info.get("symbol", "-") or "-")
+    name = esc(info.get("shortName", "-") or "-")
+    price = info.get("regularMarketPrice")
+    prev = info.get("previousClose")
+    change = ""
+    if price is not None and prev is not None:
+        ch = price - prev
+        pct = (ch / prev * 100) if prev != 0 else 0
+        change = f"{ch:.2f} ({pct:.2f}\\%)"
+    msg = (
+        f"*{symbol}* — _{name}_\n"
+        f"*السعر الحالي:* `{price}`\n"
+        f"*الإغلاق السابق:* `{prev}`\n"
+    )
+    if change:
+        msg += f"*التغير:* `{change}`\n"
+    msg += f"*أعلى اليوم:* `{info.get('dayHigh', '-')}`  *أدنى اليوم:* `{info.get('dayLow', '-')}`\n"
+    msg += f"*حجم التداول:* `{info.get('volume', '-')}`\n"
+    return msg
+
+# --- Command Handlers ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = "مرحبًا! 👋\nأنا بوت للاستعلام عن أسهم وأوبشن السوق الأمريكي.\nاستخدم /help للاطلاع على الأوامر."
+    await update.message.reply_text(text)
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        (
+            "*أوامر البوت:*\n"
+            "/start — بدء\n"
+            "/help — مساعدة\n"
+            "/price SYMBOL — سعر السهم\n"
+            "/expiries SYMBOL — تواريخ الانتهاء\n"
+            "/chain SYMBOL YYYY-MM-DD — سلسلة أوبشن\n"
+            "/option SYMBOL YYYY-MM-DD TYPE STRIKE — خيار محدد\n"
+            "/subscribe — الاشتراك بالتحديثات التلقائية\n"
+            "/unsubscribe — إلغاء الاشتراك\n"
+            "/list_subscribers — (مالك فقط) عرض المشتركين\n\n"
+            "وأوامر سريعة للأسهم الكبرى متاحة كأوامر: " + ", ".join([s.lower().replace('-', '_') for s in MAJOR_STOCKS])
+        ),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+async def price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not await rate_limit_check(user.id):
+        await update.message.reply_text("تجاوزت حد الطلبات. حاول لاحقًا.")
+        return
+    if len(context.args) < 1:
+        await update.message.reply_text("المرجو تمرير رمز السهم. مثال: /price AAPL")
+        return
+    symbol = context.args[0].upper()
     info = await fetch_ticker_info(symbol)
     if not info:
-        await update.message.reply_text(f"لم أتمكن من جلب معلومات لـ {symbol}")
+        await update.message.reply_text("لم أتمكن من جلب معلومات السهم.")
         return
     text = format_price_message(info)
-    await update.message.reply_text(text, parse_mode="MarkdownV2")
+    kb = [[InlineKeyboardButton("تواريخ الانتهاء 🗓️", callback_data=f"expiries|{symbol}")]]
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(kb))
 
-# ================= Scheduler: تشغيل كل 10 دقائق أثناء السوق الأمريكي =================
+async def expiries_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not await rate_limit_check(user.id):
+        await update.message.reply_text("تجاوزت حد الطلبات. حاول لاحقًا.")
+        return
+    if len(context.args) < 1:
+        await update.message.reply_text("استخدم: /expiries SYMBOL")
+        return
+    symbol = context.args[0].upper()
+    exps = await fetch_expiries(symbol)
+    if not exps:
+        await update.message.reply_text("لا توجد تواريخ انتهاء متاحة أو السهم غير صحيح.")
+        return
+    buttons = [[InlineKeyboardButton(e, callback_data=f"chain|{symbol}|{e}")] for e in exps[:12]]
+    await update.message.reply_text(f"تواريخ انتهاء للأوبشن لـ {symbol}:", reply_markup=InlineKeyboardMarkup(buttons))
+
+async def chain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not await rate_limit_check(user.id):
+        await update.message.reply_text("تجاوزت حد الطلبات. حاول لاحقًا.")
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("استخدم: /chain SYMBOL YYYY-MM-DD")
+        return
+    symbol = context.args[0].upper()
+    expiry = context.args[1]
+    payload = await fetch_option_chain(symbol, expiry)
+    if not payload:
+        await update.message.reply_text("تعذر جلب سلسلة الأوبشن.")
+        return
+    calls = sorted(payload["calls"], key=lambda r: r.get("openInterest", 0), reverse=True)[:8]
+    puts = sorted(payload["puts"], key=lambda r: r.get("openInterest", 0), reverse=True)[:8]
+    lines = [f"*{symbol}* — Expiry `{expiry}`\n", "*أعلى Calls حسب OI:*"]
+    for r in calls:
+        lines.append(f"`{r['strike']}` bid `{r['bid']}` ask `{r['ask']}` last `{r['lastPrice']}` oi `{int(r.get('openInterest') or 0)}`")
+    lines.append("\n*أعلى Puts حسب OI:*")
+    for r in puts:
+        lines.append(f"`{r['strike']}` bid `{r['bid']}` ask `{r['ask']}` last `{r['lastPrice']}` oi `{int(r.get('openInterest') or 0)}`")
+    kb = []
+    for r in calls[:3]:
+        kb.append([InlineKeyboardButton(f"C {r['strike']}", callback_data=f"opt|{symbol}|{expiry}|CALL|{r['strike']}")])
+    for r in puts[:3]:
+        kb.append([InlineKeyboardButton(f"P {r['strike']}", callback_data=f"opt|{symbol}|{expiry}|PUT|{r['strike']}")])
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(kb))
+
+async def option_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not await rate_limit_check(user.id):
+        await update.message.reply_text("تجاوزت حد الطلبات. حاول لاحقًا.")
+        return
+    if len(context.args) < 4:
+        await update.message.reply_text("استخدم: /option SYMBOL YYYY-MM-DD TYPE STRIKE")
+        return
+    symbol = context.args[0].upper()
+    expiry = context.args[1]
+    kind = context.args[2].upper()
+    try:
+        strike = float(context.args[3])
+    except Exception:
+        await update.message.reply_text("قيمة السترايك غير صحيحة.")
+        return
+    payload = await fetch_option_chain(symbol, expiry)
+    if not payload:
+        await update.message.reply_text("تعذر جلب سلسلة الأوبشن.")
+        return
+    df = pd.DataFrame(payload["calls"] if kind.startswith("C") else payload["puts"])
+    if df.empty:
+        await update.message.reply_text("لا توجد بيانات للخيار المطلوب.")
+        return
+    row = df.loc[df["strike"] == strike]
+    note = ""
+    if row.empty:
+        row = df.iloc[(df["strike"] - strike).abs().argsort()[:1]]
+        note = "(أقرب سترايك)"
+    r = row.iloc[0].to_dict()
+    greeks = None
+    try:
+        info = await fetch_ticker_info(symbol)
+        underlying = float(info.get("regularMarketPrice") or 0)
+        days = max(1, (datetime.fromisoformat(expiry).date() - datetime.now().date()).days)
+        vol = r.get("impliedVolatility") or 0.0
+        if vol and vol < 1:
+            vol_pct = vol * 100
+        else:
+            vol_pct = vol if vol else 30.0
+        greeks = compute_greeks_bs(underlying, r["strike"], days, vol_pct)
+    except Exception:
+        greeks = None
+    text = (
+        f"*{symbol}* {kind} Strike `{r['strike']}` Exp `{expiry}`\n"
+        f"Bid: `{r.get('bid')}`  Ask: `{r.get('ask')}`  Last: `{r.get('lastPrice')}`\n"
+        f"OI: `{int(r.get('openInterest') or 0)}`  Vol: `{int(r.get('volume') or 0)}`\n"
+    )
+    if greeks:
+        text += "\n*Greeks estimate:*\n"
+        text += f"Delta: `{greeks['delta']}`  Gamma: `{greeks['gamma']}`  Vega: `{greeks['vega']}`  Theta: `{greeks['theta']}`\n"
+    if note:
+        text += f"\n_{note}_"
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+# Callback handler for buttons
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    data = query.data or ""
+    parts = data.split("|")
+    user = update.effective_user
+    if not await rate_limit_check(user.id):
+        await query.edit_message_text("تجاوزت حد الطلبات. حاول لاحقًا.")
+        return
+    if parts[0] == "expiries" and len(parts) == 2:
+        symbol = parts[1]
+        exps = await fetch_expiries(symbol)
+        if not exps:
+            await query.edit_message_text("لا توجد تواريخ الانتهاء المتاحة.")
+            return
+        buttons = [[InlineKeyboardButton(e, callback_data=f"chain|{symbol}|{e}")] for e in exps[:12]]
+        await query.edit_message_text(f"تواريخ الانتهاء لـ {symbol}:", reply_markup=InlineKeyboardMarkup(buttons))
+    elif parts[0] == "chain" and len(parts) == 3:
+        _, symbol, expiry = parts
+        payload = await fetch_option_chain(symbol, expiry)
+        if not payload:
+            await query.edit_message_text("تعذر جلب سلسلة الأوبشن.")
+            return
+        calls = sorted(payload["calls"], key=lambda r: r.get("openInterest", 0), reverse=True)[:6]
+        puts = sorted(payload["puts"], key=lambda r: r.get("openInterest", 0), reverse=True)[:6]
+        lines = [f"*{symbol}* — Exp `{expiry}`\n"]
+        lines.append("*CALLS:*")
+        for r in calls:
+            lines.append(f"`{r['strike']}` bid `{r['bid']}` ask `{r['ask']}` oi `{int(r.get('openInterest') or 0)}`")
+        lines.append("\n*PUTS:*")
+        for r in puts:
+            lines.append(f"`{r['strike']}` bid `{r['bid']}` ask `{r['ask']}` oi `{int(r.get('openInterest') or 0)}`")
+        kb = []
+        for r in calls[:3]:
+            kb.append([InlineKeyboardButton(f"C {r['strike']}", callback_data=f"opt|{symbol}|{expiry}|CALL|{r['strike']}")])
+        for r in puts[:3]:
+            kb.append([InlineKeyboardButton(f"P {r['strike']}", callback_data=f"opt|{symbol}|{expiry}|PUT|{r['strike']}")])
+        await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(kb))
+    elif parts[0] == "opt" and len(parts) == 5:
+        _, symbol, expiry, kind, strike = parts
+        payload = await fetch_option_chain(symbol, expiry)
+        if not payload:
+            await query.edit_message_text("تعذر جلب سلسلة الأوبشن.")
+            return
+        df = pd.DataFrame(payload["calls"] if kind.startswith("C") else payload["puts"])
+        if df.empty:
+            await query.edit_message_text("لا توجد بيانات للخيار المطلوب.")
+            return
+        row = df.loc[df["strike"] == float(strike)]
+        note = ""
+        if row.empty:
+            row = df.iloc[(df["strike"] - float(strike)).abs().argsort()[:1]]
+            note = "(أقرب سترايك)"
+        r = row.iloc[0].to_dict()
+        greeks = None
+        try:
+            info = await fetch_ticker_info(symbol)
+            underlying = float(info.get("regularMarketPrice") or 0)
+            days = max(1, (datetime.fromisoformat(expiry).date() - datetime.now().date()).days)
+            vol = r.get("impliedVolatility") or 0.0
+            if vol and vol < 1:
+                vol_pct = vol * 100
+            else:
+                vol_pct = vol if vol else 30.0
+            greeks = compute_greeks_bs(underlying, r["strike"], days, vol_pct)
+        except Exception:
+            greeks = None
+        text = (
+            f"*{symbol}* {kind} Strike `{r['strike']}` Exp `{expiry}`\n"
+            f"Bid: `{r.get('bid')}`  Ask: `{r.get('ask')}`  Last: `{r.get('lastPrice')}`\n"
+            f"OI: `{int(r.get('openInterest') or 0)}`  Vol: `{int(r.get('volume') or 0)}`\n"
+        )
+        if greeks:
+            text += "\n*Greeks estimate:*\n"
+            text += f"Delta: `{greeks['delta']}`  Gamma: `{greeks['gamma']}`  Vega: `{greeks['vega']}`  Theta: `{greeks['theta']}`\n"
+        if note:
+            text += f"\n_{note}_"
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
+    else:
+        await query.edit_message_text("زر غير معروف.")
+
+# Subscription handlers
+SUBSCRIBERS_KEY = "subscribers:set"
+
+async def subscribe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    await add_subscriber(chat_id)
+    await update.message.reply_text("تم الاشتراك ✅. ستصلك التحديثات التلقائية أثناء ساعات التداول.")
+
+async def unsubscribe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    await remove_subscriber(chat_id)
+    await update.message.reply_text("تم إلغاء الاشتراك ✅.")
+
+async def list_subscribers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not OWNER_ID or str(update.effective_user.id) != str(OWNER_ID):
+        await update.message.reply_text("أمر خاص بالمالك فقط.")
+        return
+    subs = await list_subscribers()
+    if not subs:
+        await update.message.reply_text("لا يوجد مشتركين حالياً.")
+        return
+    await update.message.reply_text("قائمة المشتركين:\n" + "\n".join(sorted(list(subs))))
+
+async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("الأمر غير معروف. استخدم /help")
+
+# =========== Scheduler (every 10 minutes during NY market hours) ===========
 NY_TZ = ZoneInfo("America/New_York")
-RIYADH_TZ = ZoneInfo("Asia/Riyadh")
-
-# ساعات جلسة السوق الاعتيادية (local to New York)
 MARKET_OPEN_NY = dtime(9, 30)
 MARKET_CLOSE_NY = dtime(16, 0)
 FETCH_INTERVAL_MINUTES = 10
 
-def ny_market_open_datetime_for(date_ny: datetime.date) -> datetime:
-    return datetime.combine(date_ny, MARKET_OPEN_NY, tzinfo=NY_TZ)
-
-def ny_market_close_datetime_for(date_ny: datetime.date) -> datetime:
-    return datetime.combine(date_ny, MARKET_CLOSE_NY, tzinfo=NY_TZ)
-
-def is_market_open_now() -> bool:
-    """
-    يتحقق ما إذا كانت السوق مفتوحة الآن بالنظر إلى المنطقة الزمنية لنيورك،
-    مع مراعاة يوم الأسبوع (الاثنين-الجمعة) وعدم حساب العطل الرسمية.
-    ملاحظة: لا يتعامل هذا مع العطل الأمريكية الرسمية — لإضافة ذلك يجب ربط API خارجي أو قائمة أعياد.
-    """
+def is_market_open_now():
     now_ny = datetime.now(tz=NY_TZ)
-    # تحقق يوم الأسبوع (0=Mon .. 6=Sun)
     if now_ny.weekday() >= 5:
         return False
-    open_dt = ny_market_open_datetime_for(now_ny.date())
-    close_dt = ny_market_close_datetime_for(now_ny.date())
+    open_dt = datetime.combine(now_ny.date(), MARKET_OPEN_NY, tzinfo=NY_TZ)
+    close_dt = datetime.combine(now_ny.date(), MARKET_CLOSE_NY, tzinfo=NY_TZ)
     return open_dt <= now_ny <= close_dt
 
 async def scheduled_fetch_and_broadcast(app):
-    """
-    الوظيفة التي ستُشغّل كل 10 دقائق من الScheduler.
-    - تجلب أسعار MAJOR_STOCKS
-    - لو تم تحديد BROADCAST_CHAT_ID في المتغيرات البيئية ترسل لها الرسالة
-    """
     if not is_market_open_now():
-        logger.info("Market closed now — skipping scheduled fetch.")
+        logger.info("Market closed — skipping scheduled fetch.")
         return
-
     results = []
     for sym in MAJOR_STOCKS:
         try:
@@ -103,31 +551,110 @@ async def scheduled_fetch_and_broadcast(app):
                 pct = (ch / prev * 100) if prev else 0
                 line = f"{sym}: {price} ({ch:+.2f}, {pct:+.2f}%)"
             results.append(line)
-        except Exception as e:
+        except Exception:
             results.append(f"{sym}: خطأ")
-
     text = "*تحديث أسواق (تلقائي)*\n" + "\n".join(results)
-    # إذا حُدد BROADCAST_CHAT_ID، أرسل الرسالة هناك
-    broadcast_chat = os.getenv("BROADCAST_CHAT_ID")  # يمكن أن يكون chat_id لقناة أو مجموعة أو لِمستخدم
-    if broadcast_chat:
+
+    # Prefer BROADCAST_CHAT_ID if provided
+    if BROADCAST_CHAT_ID:
         try:
-            await app.bot.send_message(chat_id=broadcast_chat, text=text, parse_mode="Markdown")
-            logger.info("Broadcast sent to %s", broadcast_chat)
-        except Exception as e:
-            logger.exception("Failed to broadcast: %s", e)
-    else:
-        logger.info("No BROADCAST_CHAT_ID set — scheduled data fetched but not broadcasted.")
+            await app.bot.send_message(chat_id=BROADCAST_CHAT_ID, text=text, parse_mode=ParseMode.MARKDOWN)
+            logger.info("Broadcast to BROADCAST_CHAT_ID")
+            return
+        except Exception:
+            logger.exception("Failed to send to BROADCAST_CHAT_ID, will try subscribers.")
 
+    subs = await list_subscribers()
+    if not subs:
+        logger.info("No subscribers to broadcast.")
+        return
+    # send in batches of 20 with small delay to avoid hitting telegram rate limits
+    subs_list = list(subs)
+    batch_size = 20
+    for i in range(0, len(subs_list), batch_size):
+        batch = subs_list[i:i+batch_size]
+        tasks = []
+        for chat in batch:
+            try:
+                tasks.append(app.bot.send_message(chat_id=int(chat), text=text, parse_mode=ParseMode.MARKDOWN))
+            except Exception:
+                logger.exception("Failed to queue message to %s", chat)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.sleep(1)  # small pause between batches
+
+# Scheduler starter
 def start_scheduler(app):
-    """
-    يبدأ Scheduler ويضيف مهمة كرر كل 10 دقائق.
-    يجب استدعاؤه بعد بناء التطبيق (بعد ApplicationBuilder().build()) وقبل run_polling.
-    """
+    try:
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    except Exception:
+        logger.error("apscheduler missing; scheduler won't run.")
+        return
     scheduler = AsyncIOScheduler(timezone="UTC")
-    # أضف job لتنفذ كل 10 دقائق
-    scheduler.add_job(lambda: app.create_task(scheduled_fetch_and_broadcast(app)),
-                      "interval", minutes=FETCH_INTERVAL_MINUTES, next_run_time=datetime.now())
+    # schedule every FETCH_INTERVAL_MINUTES
+    scheduler.add_job(lambda: app.create_task(scheduled_fetch_and_broadcast(app)), "interval", minutes=FETCH_INTERVAL_MINUTES, next_run_time=datetime.utcnow())
     scheduler.start()
-    logger.info("Scheduler started: fetch every %s minutes (only during market open).", FETCH_INTERVAL_MINUTES)
+    logger.info("Scheduler started: every %s minutes", FETCH_INTERVAL_MINUTES)
 
-# ================= نهاية الإضافات =================
+# Quick stock handler (e.g. /aapl)
+async def quick_stock_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cmd = update.message.text.strip().lstrip("/").split()[0].upper()
+    symbol = cmd.replace("_", "-")
+    info = await fetch_ticker_info(symbol)
+    if not info:
+        await update.message.reply_text(f"لم أتمكن من جلب معلومات لـ {symbol}")
+        return
+    await update.message.reply_text(format_price_message(info), parse_mode=ParseMode.MARKDOWN)
+
+# ============ Main ============
+def main():
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    # core handlers
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("price", price_cmd))
+    app.add_handler(CommandHandler("expiries", expiries_cmd))
+    app.add_handler(CommandHandler("chain", chain_cmd))
+    app.add_handler(CommandHandler("option", option_cmd))
+    app.add_handler(CommandHandler("subscribe", subscribe_cmd))
+    app.add_handler(CommandHandler("unsubscribe", unsubscribe_cmd))
+    app.add_handler(CommandHandler("list_subscribers", list_subscribers_cmd))
+    app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_handler(MessageHandler(filters.COMMAND, unknown))
+
+    # register quick commands for major stocks
+    for sym in MAJOR_STOCKS:
+        cmd_name = sym.lower().replace("-", "_")
+        app.add_handler(CommandHandler(cmd_name, quick_stock_handler))
+
+    # set bot commands (shortcuts) async
+    async def set_commands():
+        commands = [
+            ("start","بدء"),
+            ("help","مساعدة"),
+            ("price","سعر السهم"),
+            ("expiries","تواريخ الانتهاء"),
+            ("chain","سلسلة الأوبشن"),
+            ("option","استعلام خيار"),
+            ("subscribe","الاشتراك"),
+            ("unsubscribe","إلغاء الاشتراك"),
+        ]
+        # add quicks
+        for s in MAJOR_STOCKS:
+            commands.append((s.lower().replace("-","_"), f"سعر سريع {s}"))
+        try:
+            await app.bot.set_my_commands([{"command":c,"description":d} for c,d in commands])
+        except Exception:
+            logger.exception("Failed set_my_commands")
+
+    app.create_task(set_commands())
+
+    # start scheduler
+    start_scheduler(app)
+
+    logger.info("Bot starting...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
