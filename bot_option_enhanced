@@ -1,0 +1,133 @@
+# --- إضافات: اختصارات الأوامر وScheduler للتحديث كل 10 دقائق أثناء جلسة السوق الأمريكي ---
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from zoneinfo import ZoneInfo
+from datetime import time as dtime, datetime, timedelta
+
+# قائمة الشركات الكبرى (اختصارات / أوامر سريعة)
+MAJOR_STOCKS = ["AAPL","MSFT","AMZN","GOOG","NVDA","TSLA","META","BRK-B","JPM","V"]
+
+# تعريف أوامر الاختصارات للـ BotFather / واجهة البرمجة
+DEFAULT_COMMANDS = [
+    ("start", "بدء البوت / ترحيب"),
+    ("help", "قائمة الأوامر"),
+    ("price", "سعر السهم الحالي: /price SYMBOL"),
+    ("expiries", "تواريخ انتهاء الأوبشن: /expiries SYMBOL"),
+    ("chain", "سلسلة الأوبشن: /chain SYMBOL YYYY-MM-DD"),
+    ("option", "استعلام خيار: /option SYMBOL YYYY-MM-DD TYPE STRIKE"),
+]
+# أضف اختصارات الأسهم كأوامر قصيرة
+for s in MAJOR_STOCKS:
+    DEFAULT_COMMANDS.append((s.lower(), f"سعر سريع لـ {s}"))
+
+# وظيفة مساعدة لتعيين أوامر البوت عند الإقلاع
+async def set_bot_commands(app):
+    """
+    يسجل أوامر البوت ( تظهر كـ shortcuts في واجهة المستخدم ).
+    app: ApplicationBuilder().token(...).build()
+    """
+    commands = [{"command": cmd, "description": desc} for cmd, desc in DEFAULT_COMMANDS]
+    try:
+        await app.bot.set_my_commands(commands)
+    except Exception as e:
+        logger.exception("Failed to set bot commands: %s", e)
+
+# Handler لطلبات الاختصارات السريعة (مثلاً /aapl)
+from telegram.ext import CommandHandler
+
+async def quick_stock_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    يتلقى الأمر مثل /aapl ويعيد سعر السهم المختصر.
+    اسم الدالة موجه لأننا سنربط كل اختصار ديناميكياً.
+    """
+    # أمر المستخدم مثل "/aapl" -> نأخذ اسم الأمر من update.message.text أو update.message.entities
+    cmd = update.message.text.strip().lstrip("/").split()[0].upper()
+    # بعض أوامر مثل brk-b قد تأتي على شكل brk_b في قائمة الأوامر؛ حاول تعويض
+    symbol = cmd.replace("_","-")
+    # استخدم fetch_ticker_info الموجود في سكربتك
+    info = await fetch_ticker_info(symbol)
+    if not info:
+        await update.message.reply_text(f"لم أتمكن من جلب معلومات لـ {symbol}")
+        return
+    text = format_price_message(info)
+    await update.message.reply_text(text, parse_mode="MarkdownV2")
+
+# ================= Scheduler: تشغيل كل 10 دقائق أثناء السوق الأمريكي =================
+NY_TZ = ZoneInfo("America/New_York")
+RIYADH_TZ = ZoneInfo("Asia/Riyadh")
+
+# ساعات جلسة السوق الاعتيادية (local to New York)
+MARKET_OPEN_NY = dtime(9, 30)
+MARKET_CLOSE_NY = dtime(16, 0)
+FETCH_INTERVAL_MINUTES = 10
+
+def ny_market_open_datetime_for(date_ny: datetime.date) -> datetime:
+    return datetime.combine(date_ny, MARKET_OPEN_NY, tzinfo=NY_TZ)
+
+def ny_market_close_datetime_for(date_ny: datetime.date) -> datetime:
+    return datetime.combine(date_ny, MARKET_CLOSE_NY, tzinfo=NY_TZ)
+
+def is_market_open_now() -> bool:
+    """
+    يتحقق ما إذا كانت السوق مفتوحة الآن بالنظر إلى المنطقة الزمنية لنيورك،
+    مع مراعاة يوم الأسبوع (الاثنين-الجمعة) وعدم حساب العطل الرسمية.
+    ملاحظة: لا يتعامل هذا مع العطل الأمريكية الرسمية — لإضافة ذلك يجب ربط API خارجي أو قائمة أعياد.
+    """
+    now_ny = datetime.now(tz=NY_TZ)
+    # تحقق يوم الأسبوع (0=Mon .. 6=Sun)
+    if now_ny.weekday() >= 5:
+        return False
+    open_dt = ny_market_open_datetime_for(now_ny.date())
+    close_dt = ny_market_close_datetime_for(now_ny.date())
+    return open_dt <= now_ny <= close_dt
+
+async def scheduled_fetch_and_broadcast(app):
+    """
+    الوظيفة التي ستُشغّل كل 10 دقائق من الScheduler.
+    - تجلب أسعار MAJOR_STOCKS
+    - لو تم تحديد BROADCAST_CHAT_ID في المتغيرات البيئية ترسل لها الرسالة
+    """
+    if not is_market_open_now():
+        logger.info("Market closed now — skipping scheduled fetch.")
+        return
+
+    results = []
+    for sym in MAJOR_STOCKS:
+        try:
+            info = await fetch_ticker_info(sym)
+            price = info.get("regularMarketPrice")
+            prev = info.get("previousClose")
+            if price is None:
+                line = f"{sym}: بيانات غير متوفرة"
+            else:
+                ch = price - (prev or 0)
+                pct = (ch / prev * 100) if prev else 0
+                line = f"{sym}: {price} ({ch:+.2f}, {pct:+.2f}%)"
+            results.append(line)
+        except Exception as e:
+            results.append(f"{sym}: خطأ")
+
+    text = "*تحديث أسواق (تلقائي)*\n" + "\n".join(results)
+    # إذا حُدد BROADCAST_CHAT_ID، أرسل الرسالة هناك
+    broadcast_chat = os.getenv("BROADCAST_CHAT_ID")  # يمكن أن يكون chat_id لقناة أو مجموعة أو لِمستخدم
+    if broadcast_chat:
+        try:
+            await app.bot.send_message(chat_id=broadcast_chat, text=text, parse_mode="Markdown")
+            logger.info("Broadcast sent to %s", broadcast_chat)
+        except Exception as e:
+            logger.exception("Failed to broadcast: %s", e)
+    else:
+        logger.info("No BROADCAST_CHAT_ID set — scheduled data fetched but not broadcasted.")
+
+def start_scheduler(app):
+    """
+    يبدأ Scheduler ويضيف مهمة كرر كل 10 دقائق.
+    يجب استدعاؤه بعد بناء التطبيق (بعد ApplicationBuilder().build()) وقبل run_polling.
+    """
+    scheduler = AsyncIOScheduler(timezone="UTC")
+    # أضف job لتنفذ كل 10 دقائق
+    scheduler.add_job(lambda: app.create_task(scheduled_fetch_and_broadcast(app)),
+                      "interval", minutes=FETCH_INTERVAL_MINUTES, next_run_time=datetime.now())
+    scheduler.start()
+    logger.info("Scheduler started: fetch every %s minutes (only during market open).", FETCH_INTERVAL_MINUTES)
+
+# ================= نهاية الإضافات =================
