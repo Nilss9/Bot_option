@@ -191,18 +191,42 @@ async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Main ---
 def main():
+    # ابني التطبيق
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
+    # --- Handlers الأساسية ---
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("price", price))
-    app.add_handler(CommandHandler("expiries", expiries))
-    app.add_handler(CommandHandler("chain", chain))
-    app.add_handler(CommandHandler("option", option_single))
+    app.add_handler(CommandHandler("expiries", expiries_cmd))
+    app.add_handler(CommandHandler("chain", chain_cmd))
+    app.add_handler(CommandHandler("option", option_cmd))
+    app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
-    logger.info("Bot started.")
-    app.run_polling()
+    # --- ربط اختصارات الشركات الكبرى كسياق أوامر سريعة ---
+    # مثال: /aapl -> quick_stock_handler
+    for sym in MAJOR_STOCKS:
+        # نربط كل اسم أمر متناظر بصيغة lower case (Telegram commands يجب أن تكون كلها أحرف صغيرة)
+        cmd_name = sym.lower().replace("-", "_")  # brk-b -> brk_b لتفادي "-" في أسماء الأوامر
+        app.add_handler(CommandHandler(cmd_name, quick_stock_handler))
 
+    # ---- ضبط أوامر البوت لتظهر في واجهة Telegram (shortcuts) ----
+    # ستظهر هذه الأوامر في قائمة الاختصارات داخل تطبيق Telegram للمستخدمين
+    try:
+        # create_task لأن set_bot_commands هي دالة async ونريد تشغيلها داخل حلقة الأحداث
+        app.create_task(set_bot_commands(app))
+    except Exception as e:
+        logger.exception("Could not schedule set_bot_commands task: %s", e)
+
+    # ---- بدء الScheduler (للتحديث كل 10 دقائق أثناء السوق المفتوح) ----
+    try:
+        start_scheduler(app)
+    except Exception as e:
+        logger.exception("Could not start scheduler: %s", e)
+
+    # ---- تشغيل البوت ----
+    logger.info("Bot is starting. Polling now...")
+    app.run_polling()
 if __name__ == "__main__":
     main()
