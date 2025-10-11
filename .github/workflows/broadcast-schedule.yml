@@ -2,7 +2,7 @@ name: Broadcast schedule (with config.json from secrets)
 
 on:
   schedule:
-    - cron: '*/10 * * * *'   # كل 10 دقائق
+    - cron: '*/15 * * * *'   # كل 15 دقائق
   workflow_dispatch:
 
 jobs:
