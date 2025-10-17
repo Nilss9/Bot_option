@@ -1,1 +1,51 @@
+name: Broadcast schedule (with config.json from secrets)
 
+on:
+  schedule:
+    - cron: '*/15 * * * *'   # كل 15 دقائق
+  workflow_dispatch:
+
+jobs:
+  broadcast:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Create config.json from Secrets
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          BROADCAST_CHAT_ID: ${{ secrets.BROADCAST_CHAT_ID }}
+          OWNER_ID: ${{ secrets.OWNER_ID }}
+        run: |
+          if [ -z "${TELEGRAM_TOKEN}" ]; then
+            echo "ERROR: TELEGRAM_TOKEN secret is not set" >&2
+            exit 1
+          fi
+          cat > config.json <<'JSON'
+{
+  "TELEGRAM_TOKEN": "${TELEGRAM_TOKEN}",
+  "BROADCAST_CHAT_ID": "${BROADCAST_CHAT_ID}",
+  "OWNER_ID": "${OWNER_ID}"
+}
+JSON
+          chmod 600 config.json
+          echo "config.json created."
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run broadcast once
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          BROADCAST_CHAT_ID: ${{ secrets.BROADCAST_CHAT_ID }}
+        run: |
+          python broadcast_once.py
